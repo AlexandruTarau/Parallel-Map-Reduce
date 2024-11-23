@@ -16,6 +16,20 @@ typedef struct {
     char *text;
 } File;
 
+struct ThreadArgs {
+    long id;
+    std::queue<File> *file_queue;
+    std::vector<std::map<std::pair<std::string, int>, bool>> *partial_maps;
+    std::vector<std::pair<std::string, int>> *words;
+    pthread_mutex_t *queue_mutex;
+    pthread_mutex_t *words_mutex;
+    pthread_barrier_t *mappers_barrier;
+    pthread_barrier_t *reducers_barrier;
+    std::vector<pthread_mutex_t> *map_mutexes;
+    int array_size;
+    int num_threads;
+};
+
 // REMOVE GLOBAL VARIABLES LATER!!!!!!!!!
 pthread_barrier_t mappers_barrier;
 pthread_barrier_t reducers_barrier;
@@ -211,12 +225,11 @@ int main(int argc, char *argv[])
     int reducers_nr = atoi(argv[2]);
     pthread_t mappers[mappers_nr];
     pthread_t reducers[reducers_nr];
-
+    
     int r;
     long id;
     void *status;
     long ids[mappers_nr + reducers_nr];
-    
     int n;  // Number of files
     FILE *input_file = fopen(argv[3], "r");
     FILE **files;
@@ -225,12 +238,13 @@ int main(int argc, char *argv[])
 
     // Initialize the output files
     for (int i = 0; i < 26; i++) {
-        char file_name[5];
+        char file_name[6];
         file_name[0] = 'a' + i;
         file_name[1] = '.';
         file_name[2] = 't';
         file_name[3] = 'x';
         file_name[4] = 't';
+        file_name[5] = '\0';
         output_files[i] = fopen(file_name, "w+");
 
         // Check if the file was opened successfully
@@ -297,27 +311,25 @@ int main(int argc, char *argv[])
     }
 
     // Create mappers and reducers
-    for (id = 0; id < mappers_nr; id++) {
+    for (id = 0; id < mappers_nr + reducers_nr; id++) {
         ids[id] = id;
-        partial_maps[ids[id]] = std::map<std::pair<std::string, int>, bool>();
-        r = pthread_create(&mappers[id], NULL, map_func, &ids[id]);
 
+        if (id < mappers_nr) {
+            partial_maps[ids[id]] = std::map<std::pair<std::string, int>, bool>();
+            r = pthread_create(&mappers[id], NULL, map_func, &ids[id]);
+        } else {
+            if (id == mappers_nr) {  // Wait for the mappers to finish
+                pthread_barrier_wait(&mappers_barrier);
+                array_size = words.size();
+                num_threads = reducers_nr;
+            }
+
+            int reducer_id = id - mappers_nr;
+            ids[id] = reducer_id;
+            r = pthread_create(&reducers[reducer_id], NULL, reduce_func, &ids[id]);
+        }
         if (r) {
             printf("ERROR: couldn't create thread %ld", ids[id]);
-            exit(-1);
-        }
-    }
-
-    pthread_barrier_wait(&mappers_barrier);
-    array_size = words.size();
-    num_threads = reducers_nr;
-
-    for (id = 0; id < reducers_nr; id++) {
-        ids[id + mappers_nr] = id + mappers_nr;
-        r = pthread_create(&reducers[id], NULL, reduce_func, &ids[id + mappers_nr] - mappers_nr);
-
-        if (r) {
-            printf("ERROR: couldn't create thread %ld", ids[id + mappers_nr]);
             exit(-1);
         }
     }
