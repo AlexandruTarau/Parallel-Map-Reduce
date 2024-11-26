@@ -21,7 +21,8 @@ struct ThreadArgs {
     std::queue<File> *file_queue;
     std::vector<std::map<std::pair<std::string, int>, bool>> *partial_maps;
     std::vector<std::pair<std::string, int>> *words;
-    std::vector<std::pair<std::string, std::vector<int>>> *complete_map;
+    // std::vector<std::pair<std::string, std::vector<int>>> *complete_map;
+    std::map<std::string, std::vector<int>> *complete_map;
     pthread_mutex_t *queue_mutex;
     pthread_mutex_t *words_mutex;
     pthread_mutex_t *complete_map_mutex;
@@ -185,7 +186,8 @@ void *reduce_func(void *args) {
     long id = thread_args->id;
     std::vector<std::pair<std::string, int>> &words = *thread_args->words;
     pthread_mutex_t &complete_map_mutex = *thread_args->complete_map_mutex;
-    std::vector<std::pair<std::string, std::vector<int>>> &complete_map = *thread_args->complete_map;
+    //std::vector<std::pair<std::string, std::vector<int>>> &complete_map = *thread_args->complete_map;
+    std::map<std::string, std::vector<int>> &complete_map = *thread_args->complete_map;
     pthread_barrier_t &reducers_barrier = *thread_args->reducers_barrier;
     int array_size = words.size();
     int num_threads = thread_args->num_threads;
@@ -207,7 +209,14 @@ void *reduce_func(void *args) {
         // });
 
         // If the word is in the map, add the file id to the vector
-        auto it = complete_map.begin();
+        if (complete_map.find(word.first) != complete_map.end()) {
+            complete_map[word.first].push_back(word.second);
+        } else {
+            std::vector<int> v;
+            v.push_back(word.second);
+            complete_map[word.first] = v;
+        }
+        /*auto it = complete_map.begin();
         for (; it != complete_map.end(); it++) {
             if (it->first == word.first) {
                 it->second.push_back(word.second);
@@ -220,8 +229,8 @@ void *reduce_func(void *args) {
             std::vector<int> v;
             v.push_back(word.second);
             complete_map.push_back(std::make_pair(word.first, v));
-        }
-
+        }*/
+        
         pthread_mutex_unlock(&complete_map_mutex);
     }
 
@@ -231,24 +240,91 @@ void *reduce_func(void *args) {
     start = id * complete_map_size / num_threads;
     end = min((id + 1) * complete_map_size / num_threads, complete_map_size);
 
-    for (int i = start; i < end; i++) {
-        int letter = complete_map[i].first[0] - 'a';
+    auto it = complete_map.begin();
+    std::advance(it, start);
+    auto it_end = complete_map.begin();
+    std::advance(it_end, end);
+
+    for (; it != it_end; it++) {
+        int letter = it->first[0] - 'a';
 
         pthread_mutex_lock(&files_mutexes[letter]);
 
-        fprintf(output_files[letter], "%s:[", complete_map[i].first.c_str());
-        for (long unsigned int j = 0; j < complete_map[i].second.size(); j++) {
-            fprintf(output_files[letter], "%d", complete_map[i].second[j]);
-            if (j != complete_map[i].second.size() - 1) {
+        fprintf(output_files[letter], "%s:[", it->first.c_str());
+        for (long unsigned int j = 0; j < it->second.size(); j++) {
+            fprintf(output_files[letter], "%d", it->second[j]);
+            if (j != it->second.size() - 1) {
                 fprintf(output_files[letter], " ");
             }
         }
         fprintf(output_files[letter], "]\n");
+
         pthread_mutex_unlock(&files_mutexes[letter]);
     }
 
+    // for (int i = start; i < end; i++) {
+    //     int letter = complete_map[i].first[0] - 'a';
+
+    //     pthread_mutex_lock(&files_mutexes[letter]);
+
+    //     fprintf(output_files[letter], "%s:[", complete_map[i].first.c_str());
+    //     for (long unsigned int j = 0; j < complete_map[i].second.size(); j++) {
+    //         fprintf(output_files[letter], "%d", complete_map[i].second[j]);
+    //         if (j != complete_map[i].second.size() - 1) {
+    //             fprintf(output_files[letter], " ");
+    //         }
+    //     }
+    //     fprintf(output_files[letter], "]\n");
+    //     pthread_mutex_unlock(&files_mutexes[letter]);
+    // }
+
     pthread_barrier_wait(&reducers_barrier);
 
+    it = complete_map.begin();
+    std::advance(it, start);
+
+    for (; it != it_end; it++) {
+        int letter = it->first[0] - 'a';
+        std::map<std::string, std::vector<int>> file_words;
+        char *line = NULL;
+        size_t len = 0;
+
+        pthread_mutex_lock(&files_mutexes[letter]);
+        fseek(output_files[letter], 0, SEEK_SET);
+
+        std::vector<std::pair<std::string, std::vector<int>>> file_words_vec;
+
+        // Parse file lines directly into file_words_vec
+        while (getline(&line, &len, output_files[letter]) != -1) {
+            char *save_ptr;
+            char *word = strtok_r(line, " \n\t:[]", &save_ptr);
+            std::string word_str = word;
+            std::vector<int> v;
+            while ((word = strtok_r(NULL, " \n\t:[]", &save_ptr)) != NULL) {
+                v.push_back(atoi(word));
+            }
+            std::sort(v.begin(), v.end());
+            file_words_vec.push_back({word_str, v});
+        }
+
+        // Sort file_words_vec using your custom comparator
+        std::sort(file_words_vec.begin(), file_words_vec.end(), compare_complete_map);
+
+        fseek(output_files[letter], 0, SEEK_SET);
+
+        for (long unsigned int j = 0; j < file_words_vec.size(); j++) {
+            fprintf(output_files[letter], "%s:[", file_words_vec[j].first.c_str());
+            for (long unsigned int k = 0; k < file_words_vec[j].second.size(); k++) {
+                fprintf(output_files[letter], "%d", file_words_vec[j].second[k]);
+                if (k != file_words_vec[j].second.size() - 1) {
+                    fprintf(output_files[letter], " ");
+                }
+            }
+            fprintf(output_files[letter], "]\n");
+        }
+        pthread_mutex_unlock(&files_mutexes[letter]);
+    }
+/*
     for (int i = start; i < end; i++) {
         int letter = complete_map[i].first[0] - 'a';
         std::vector<std::pair<std::string, std::vector<int>>> file_words;
@@ -288,7 +364,7 @@ void *reduce_func(void *args) {
         }
         pthread_mutex_unlock(&files_mutexes[letter]);
     }
-
+*/
     return NULL;
 }
 
@@ -316,7 +392,8 @@ int main(int argc, char *argv[])
     pthread_barrier_t reducers_barrier;
     std::vector<std::map<std::pair<std::string, int>, bool>> partial_maps;
     std::vector<std::pair<std::string, int>> words;
-    std::vector<std::pair<std::string, std::vector<int>>> complete_map;
+    //std::vector<std::pair<std::string, std::vector<int>>> complete_map;
+    std::map<std::string, std::vector<int>> complete_map;
     std::queue<File> file_queue;
     std::vector<pthread_mutex_t> map_mutexes;
     pthread_mutex_t complete_map_mutex;
