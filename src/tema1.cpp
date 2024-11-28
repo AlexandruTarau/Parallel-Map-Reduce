@@ -16,6 +16,7 @@ struct File {
     char *text;
 };
 
+// Thread arguments structure
 struct ThreadArgs {
     long id;
     int num_threads;
@@ -32,6 +33,7 @@ struct ThreadArgs {
     FILE **output_files;
 };
 
+// Clean up function
 void cleanup(FILE **files, File *files_struct, std::queue<File>& file_queue,
              FILE **output_files, FILE *input_file, int n) {
 
@@ -69,12 +71,6 @@ void cleanup(FILE **files, File *files_struct, std::queue<File>& file_queue,
     if (input_file != NULL) {
         fclose(input_file);
     }
-}
-
-
-// Function that returns the minimum of 2 numbers
-double min(double x, double y) {
-    return x < y ? x : y;
 }
 
 // Get the size of a file
@@ -199,7 +195,7 @@ void *reduce_func(void *args) {
     int num_threads = thread_args->num_threads;
     
     int start = id * (double)array_size / num_threads;
-    int end = min((id + 1) * (double)array_size / num_threads, array_size);
+    int end = std::min((id + 1) * (double)array_size / num_threads, (double) array_size);
 
     // Add the words to the complete map
     for (int i = start; i < end; i++) {
@@ -217,7 +213,7 @@ void *reduce_func(void *args) {
     pthread_barrier_wait(&reducers_barrier);
  
     start = id * 26 / num_threads;
-    end = min((id + 1) * 26 / num_threads, 26);
+    end = std::min((id + 1) * 26.0f / num_threads, 26.0f);
 
     // Sort and write the words to the output files
     for (int letter = start; letter < end; letter++) {
