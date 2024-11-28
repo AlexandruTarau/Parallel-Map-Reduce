@@ -221,8 +221,6 @@ void *reduce_func(void *args) {
 
     // Sort and write the words to the output files
     for (int letter = start; letter < end; letter++) {
-        pthread_mutex_lock(&letter_mutexes[letter]);
-
         std::map<std::string, std::vector<int>>::iterator it = complete_map[letter].begin();
         std::map<std::string, std::vector<int>>::iterator it_end = complete_map[letter].end();
 
@@ -252,7 +250,6 @@ void *reduce_func(void *args) {
             }
             fprintf(output_files[letter], "]\n");
         }
-        pthread_mutex_unlock(&letter_mutexes[letter]);
     }
 
     return NULL;
