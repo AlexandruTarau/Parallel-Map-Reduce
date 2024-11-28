@@ -10,27 +10,26 @@
 #include <algorithm>
 
 // File structure
-typedef struct {
+struct File {
     int id;
     int size;
     char *text;
-} File;
+};
 
 struct ThreadArgs {
     long id;
+    int num_threads;
     std::queue<File> *file_queue;
     std::vector<std::map<std::pair<std::string, int>, bool>> *partial_maps;
     std::vector<std::pair<std::string, int>> *words;
-    std::vector<std::pair<std::string, std::vector<int>>> *complete_map;
+    std::vector<std::map<std::string, std::vector<int>>> *complete_map;
     pthread_mutex_t *queue_mutex;
     pthread_mutex_t *words_mutex;
-    pthread_mutex_t *complete_map_mutex;
-    pthread_mutex_t *files_mutex;
-    pthread_barrier_t *mappers_barrier;
+    pthread_mutex_t *letter_mutexes;
+    pthread_barrier_t *barrier;
     pthread_barrier_t *reducers_barrier;
     std::vector<pthread_mutex_t> *map_mutexes;
     FILE **output_files;
-    int num_threads;
 };
 
 void cleanup(FILE **files, File *files_struct, std::queue<File>& file_queue,
@@ -119,6 +118,7 @@ bool compare_complete_map(const std::pair<std::string, std::vector<int>>& a, con
     return a.first < b.first; // Sort by string in ascending order
 }
 
+// Mapper function
 void *map_func(void *args) {
     ThreadArgs *thread_args = (ThreadArgs *)args;
     long id = thread_args->id;
@@ -127,11 +127,13 @@ void *map_func(void *args) {
     std::vector<std::pair<std::string, int>> &words = *thread_args->words;
     pthread_mutex_t &queue_mutex = *thread_args->queue_mutex;
     pthread_mutex_t &words_mutex = *thread_args->words_mutex;
-    pthread_barrier_t &mappers_barrier = *thread_args->mappers_barrier;
-    std::vector<pthread_mutex_t> &map_mutexes = *thread_args->map_mutexes;
+    pthread_barrier_t &barrier = *thread_args->barrier;
+    
     File file;
+    std::vector<std::pair<std::string, int>> local_words;
 
     while (1) {
+        // Get the next file from the queue
         pthread_mutex_lock(&queue_mutex);
         if (file_queue.empty()) {
             pthread_mutex_unlock(&queue_mutex);
@@ -141,152 +143,116 @@ void *map_func(void *args) {
         file_queue.pop();
         pthread_mutex_unlock(&queue_mutex);
 
-        char *aux = (char *)malloc((file.size + 1) * sizeof(char));
-        strcpy(aux, file.text);
-
+        // Parse the file
         char *save_ptr;
-        char *word = strtok_r(aux, " \n\t", &save_ptr);
+        char *word = strtok_r(file.text, " \n\t", &save_ptr);
         while (word != NULL) {
             bool found = false;
             remove_special_chars(word);
-            if (word[0] == '\0') {
+            if (word[0] == '\0') {  // Ignore words that contain only special characters
                 word = strtok_r(NULL, " \n\t", &save_ptr);
                 continue;
             }
 
             // Add the word to the partial map
-            pthread_mutex_lock(&map_mutexes[id]);
             std::pair<std::string, int> key = std::make_pair(word, file.id);
             if (partial_maps[id].find(key) != partial_maps[id].end()) {
                 found = true;
-            }
+            }   
             partial_maps[id][key] = true;
-            pthread_mutex_unlock(&map_mutexes[id]);
 
-            // Add the word to the words vector
+            // Add the word to the local words vector
             if (!found) {
-                pthread_mutex_lock(&words_mutex);
-                words.push_back(key);
-                pthread_mutex_unlock(&words_mutex);
+                local_words.push_back(key);
             }
 
             word = strtok_r(NULL, " \n\t", &save_ptr);
         }
-        free(aux);
     }
+
+    // Add the local words to the shared words vector to minimize locks number
+    pthread_mutex_lock(&words_mutex);
+    words.insert(words.end(), local_words.begin(), local_words.end());
+    pthread_mutex_unlock(&words_mutex);
     
-    pthread_barrier_wait(&mappers_barrier);
+    pthread_barrier_wait(&barrier);
 
     return NULL;
 }
 
+// Reducer function
 void *reduce_func(void *args) {
     ThreadArgs *thread_args = (ThreadArgs *)args;
     long id = thread_args->id;
+    pthread_barrier_t &barrier = *thread_args->barrier;
+
+    // Wait the mappers to finish
+    pthread_barrier_wait(&barrier);
+
     std::vector<std::pair<std::string, int>> &words = *thread_args->words;
-    pthread_mutex_t &complete_map_mutex = *thread_args->complete_map_mutex;
-    std::vector<std::pair<std::string, std::vector<int>>> &complete_map = *thread_args->complete_map;
+    std::vector<std::map<std::string, std::vector<int>>> &complete_map = *thread_args->complete_map;
     pthread_barrier_t &reducers_barrier = *thread_args->reducers_barrier;
+    FILE **output_files = thread_args->output_files;
+    pthread_mutex_t *letter_mutexes = thread_args->letter_mutexes;
+
     int array_size = words.size();
     int num_threads = thread_args->num_threads;
-    FILE **output_files = thread_args->output_files;
-    pthread_mutex_t *files_mutexes = thread_args->files_mutex;
     
     int start = id * (double)array_size / num_threads;
     int end = min((id + 1) * (double)array_size / num_threads, array_size);
 
+    // Add the words to the complete map
     for (int i = start; i < end; i++) {
         std::pair<std::string, int> word = words[i];
-        pthread_mutex_lock(&complete_map_mutex);
+        int letter = word.first[0] - 'a';
 
-        // auto it = std::find_if(
-        //     complete_map.begin(),
-        //     complete_map.end(),
-        //     [&](const auto &p) {
-        //     return p.first == word.first;
-        // });
+        pthread_mutex_lock(&letter_mutexes[letter]);
 
-        // If the word is in the map, add the file id to the vector
-        auto it = complete_map.begin();
-        for (; it != complete_map.end(); it++) {
-            if (it->first == word.first) {
-                it->second.push_back(word.second);
-                break;
-            }
-        }
+        complete_map[letter][word.first].push_back(word.second);
 
-        // If the word is not in the map, add it
-        if (it == complete_map.end()) {
-            std::vector<int> v;
-            v.push_back(word.second);
-            complete_map.push_back(std::make_pair(word.first, v));
-        }
-
-        pthread_mutex_unlock(&complete_map_mutex);
+        pthread_mutex_unlock(&letter_mutexes[letter]);
     }
 
+    // Wait until the complete map is done
     pthread_barrier_wait(&reducers_barrier);
+ 
+    start = id * 26 / num_threads;
+    end = min((id + 1) * 26 / num_threads, 26);
 
-    int complete_map_size = complete_map.size();
-    start = id * complete_map_size / num_threads;
-    end = min((id + 1) * complete_map_size / num_threads, complete_map_size);
+    // Sort and write the words to the output files
+    for (int letter = start; letter < end; letter++) {
+        pthread_mutex_lock(&letter_mutexes[letter]);
 
-    for (int i = start; i < end; i++) {
-        int letter = complete_map[i].first[0] - 'a';
+        std::map<std::string, std::vector<int>>::iterator it = complete_map[letter].begin();
+        std::map<std::string, std::vector<int>>::iterator it_end = complete_map[letter].end();
 
-        pthread_mutex_lock(&files_mutexes[letter]);
+        std::vector<std::pair<std::string, std::vector<int>>> file_words_vec;
 
-        fprintf(output_files[letter], "%s:[", complete_map[i].first.c_str());
-        for (long unsigned int j = 0; j < complete_map[i].second.size(); j++) {
-            fprintf(output_files[letter], "%d", complete_map[i].second[j]);
-            if (j != complete_map[i].second.size() - 1) {
-                fprintf(output_files[letter], " ");
-            }
-        }
-        fprintf(output_files[letter], "]\n");
-        pthread_mutex_unlock(&files_mutexes[letter]);
-    }
+        for (; it != it_end; it++) {
+            // Sort the file ids
+            std::sort(it->second.begin(), it->second.end());
 
-    pthread_barrier_wait(&reducers_barrier);
-
-    for (int i = start; i < end; i++) {
-        int letter = complete_map[i].first[0] - 'a';
-        std::vector<std::pair<std::string, std::vector<int>>> file_words;
-        char *line = NULL;
-        size_t len = 0;
-
-        pthread_mutex_lock(&files_mutexes[letter]);
-        fseek(output_files[letter], 0, SEEK_SET);
-
-        // Parce each line and store it in a vector
-        char *save_ptr;
-        while (getline(&line, &len, output_files[letter]) != -1) {
-            char *word = strtok_r(line, " \n\t:[]", &save_ptr);
-            std::string word_str = word;
-            std::vector<int> v;
-            while ((word = strtok_r(NULL, " \n\t:[]", &save_ptr)) != NULL) {
-                v.push_back(atoi(word));
-            }
-            std::sort(v.begin(), v.end());
-
-            file_words.push_back(std::make_pair(word_str, v));
+            // Add all words that start with the current letter to a vector to sort them
+            file_words_vec.push_back({it->first, it->second});
         }
 
-        std::sort(file_words.begin(), file_words.end(), compare_complete_map);
+        // Sort the words starting with the current letter
+        std::sort(file_words_vec.begin(), file_words_vec.end(), compare_complete_map);
 
+        // Write the words to the output file
         fseek(output_files[letter], 0, SEEK_SET);
 
-        for (long unsigned int j = 0; j < file_words.size(); j++) {
-            fprintf(output_files[letter], "%s:[", file_words[j].first.c_str());
-            for (long unsigned int k = 0; k < file_words[j].second.size(); k++) {
-                fprintf(output_files[letter], "%d", file_words[j].second[k]);
-                if (k != file_words[j].second.size() - 1) {
+        for (long unsigned int j = 0; j < file_words_vec.size(); j++) {
+            fprintf(output_files[letter], "%s:[", file_words_vec[j].first.c_str());
+            for (long unsigned int k = 0; k < file_words_vec[j].second.size(); k++) {
+                fprintf(output_files[letter], "%d", file_words_vec[j].second[k]);
+                if (k != file_words_vec[j].second.size() - 1) {
                     fprintf(output_files[letter], " ");
                 }
             }
             fprintf(output_files[letter], "]\n");
         }
-        pthread_mutex_unlock(&files_mutexes[letter]);
+        pthread_mutex_unlock(&letter_mutexes[letter]);
     }
 
     return NULL;
@@ -294,7 +260,6 @@ void *reduce_func(void *args) {
 
 int main(int argc, char *argv[])
 {
-    // Check if the number of arguments is correct
     if (argc != 4) {
         printf("Usage: ./tema1 <mappers_number> <reducers_number> <input_file>\n");
         exit(-1);
@@ -308,26 +273,29 @@ int main(int argc, char *argv[])
     int r;
     long id;
     void *status;
-    int n;  // Number of files
+    int n = 0;  // Number of files
     FILE *input_file = fopen(argv[3], "r");
     FILE **files;
 
-    pthread_barrier_t mappers_barrier;
+    if (input_file == NULL) {
+        printf("ERROR: couldn't open file %s\n", argv[3]);
+        exit(-1);
+    }
+
+    pthread_barrier_t barrier;
     pthread_barrier_t reducers_barrier;
     std::vector<std::map<std::pair<std::string, int>, bool>> partial_maps;
     std::vector<std::pair<std::string, int>> words;
-    std::vector<std::pair<std::string, std::vector<int>>> complete_map;
+    std::vector<std::map<std::string, std::vector<int>>> complete_map(26);
     std::queue<File> file_queue;
-    std::vector<pthread_mutex_t> map_mutexes;
-    pthread_mutex_t complete_map_mutex;
     pthread_mutex_t queue_mutex;
     pthread_mutex_t words_mutex;
     FILE *output_files[26];
-    pthread_mutex_t files_mutexes[26];
+    pthread_mutex_t letter_mutexes[26];
 
     std::vector<ThreadArgs> thread_args(mappers_nr + reducers_nr);
 
-    partial_maps.resize(mappers_nr);
+    partial_maps.reserve(mappers_nr);
 
     // Initialize the output files
     for (int i = 0; i < 26; i++) {
@@ -340,7 +308,6 @@ int main(int argc, char *argv[])
         file_name[5] = '\0';
         output_files[i] = fopen(file_name, "w+");
 
-        // Check if the file was opened successfully
         if (output_files[i] == NULL) {
             printf("ERROR: couldn't open file %s", file_name);
             cleanup(NULL, NULL, file_queue, output_files, input_file, n);
@@ -349,28 +316,16 @@ int main(int argc, char *argv[])
     }
 
     // Initialize the mutexes
-    map_mutexes.resize(mappers_nr);
-    for (int i = 0; i < mappers_nr; i++) {
-        pthread_mutex_init(&map_mutexes[i], NULL);
-    }
     pthread_mutex_init(&queue_mutex, NULL);
     pthread_mutex_init(&words_mutex, NULL);
-    pthread_mutex_init(&complete_map_mutex, NULL);
 
     for (int i = 0; i < 26; i++) {
-        pthread_mutex_init(&files_mutexes[i], NULL);
+        pthread_mutex_init(&letter_mutexes[i], NULL);
     }
 
-    // Initialize the mappers and reducers barriers
-    pthread_barrier_init(&mappers_barrier, NULL, mappers_nr + 1);
+    // Initialize the barriers
+    pthread_barrier_init(&barrier, NULL, mappers_nr + reducers_nr);
     pthread_barrier_init(&reducers_barrier, NULL, reducers_nr);
-
-    // Check if the input file was opened successfully
-    if (input_file == NULL) {
-        printf("ERROR: couldn't open file %s\n", argv[3]);
-        cleanup(NULL, NULL, file_queue, output_files, input_file, n);
-        exit(-1);
-    }
 
     // Read the files
     r = fscanf(input_file, "%d", &n);
@@ -386,7 +341,6 @@ int main(int argc, char *argv[])
         fscanf(input_file, "%s", file_name);
         files[i] = fopen(file_name, "r");
 
-        // Check if the file was opened successfully
         if (files[i] == NULL) {
             printf("ERROR: couldn't open file %s", file_name);
             cleanup(files, NULL, file_queue, output_files, input_file, n);
@@ -394,7 +348,7 @@ int main(int argc, char *argv[])
         }
     }
 
-    // Sort the files by size in descending order
+    // Read the files content
     File *files_struct = (File *)malloc(n * sizeof(File));
     if (files_struct == NULL) {
         fprintf(stderr, "Error allocating memory for files_struct\n");
@@ -416,9 +370,10 @@ int main(int argc, char *argv[])
         files_struct[i].text[files_struct[i].size] = '\0';
     }
 
+    // Sort the files by size in descending order
     qsort(files_struct, n, sizeof(File), compare_files);
 
-    // Create the queue
+    // Put every file in a queue ordered by size
     for (int i = 0; i < n; i++) {
         file_queue.push(files_struct[i]);
     }
@@ -430,28 +385,21 @@ int main(int argc, char *argv[])
         thread_args[id].words = &words;
         thread_args[id].queue_mutex = &queue_mutex;
         thread_args[id].words_mutex = &words_mutex;
-        thread_args[id].mappers_barrier = &mappers_barrier;
+        thread_args[id].barrier = &barrier;
         thread_args[id].reducers_barrier = &reducers_barrier;
-        thread_args[id].map_mutexes = &map_mutexes;
-        thread_args[id].files_mutex = files_mutexes;
-        thread_args[id].complete_map_mutex = &complete_map_mutex;
+        thread_args[id].letter_mutexes = letter_mutexes;
         thread_args[id].complete_map = &complete_map;
         thread_args[id].output_files = output_files;
 
-        if (id < mappers_nr) {
+        if (id < mappers_nr) {  // Create mappers
             thread_args[id].id = id;
             thread_args[id].num_threads = mappers_nr;
             partial_maps[id] = std::map<std::pair<std::string, int>, bool>();
             r = pthread_create(&mappers[id], NULL, map_func, &thread_args[id]);
-        } else {
+        } else {  // Create reducers
             thread_args[id].id = id - mappers_nr;
             thread_args[id].num_threads = reducers_nr;
-            if (id == mappers_nr) {  // Wait for the mappers to finish
-                pthread_barrier_wait(&mappers_barrier);
-            }
-
-            int reducer_id = id - mappers_nr;
-            r = pthread_create(&reducers[reducer_id], NULL, reduce_func, &thread_args[id]);
+            r = pthread_create(&reducers[id - mappers_nr], NULL, reduce_func, &thread_args[id]);
         }
         if (r) {
             printf("ERROR: couldn't create thread %ld", thread_args[id].id);
@@ -461,18 +409,12 @@ int main(int argc, char *argv[])
     }
 
     // Join mappers and reducers
-    for (id = 0; id < mappers_nr; id++) {
-        r = pthread_join(mappers[id], &status);
-
-        if (r) {
-            printf("ERROR: couldn't join thread %ld", id);
-            cleanup(files, files_struct, file_queue, output_files, input_file, n);
-            exit(-1);
+    for (id = 0; id < mappers_nr + reducers_nr; id++) {
+        if (id < mappers_nr) {
+            r = pthread_join(mappers[id], &status);
+        } else {
+            r = pthread_join(reducers[id - mappers_nr], &status);
         }
-    }
-
-    for (id = 0; id < reducers_nr; id++) {
-        r = pthread_join(reducers[id], &status);
 
         if (r) {
             printf("ERROR: couldn't join thread %ld", id);
@@ -482,26 +424,22 @@ int main(int argc, char *argv[])
     }
 
     // Destroy the mutexes
-    for (int i = 0; i < mappers_nr; i++) {
-        pthread_mutex_destroy(&map_mutexes[i]);
-    }
-
     pthread_mutex_destroy(&queue_mutex);
     pthread_mutex_destroy(&words_mutex);
-    pthread_mutex_destroy(&complete_map_mutex);
 
     for (int i = 0; i < 26; i++) {
-        pthread_mutex_destroy(&files_mutexes[i]);
+        pthread_mutex_destroy(&letter_mutexes[i]);
     }
 
     // Destroy the barriers
-    if (pthread_barrier_destroy(&mappers_barrier) != 0) {
+    if (pthread_barrier_destroy(&barrier) != 0) {
         fprintf(stderr, "Error destroying mappers_barrier\n");
     }
     if (pthread_barrier_destroy(&reducers_barrier) != 0) {
         fprintf(stderr, "Error destroying reducers_barrier\n");
     }
 
+    // Free allocated memory
     cleanup(files, files_struct, file_queue, output_files, input_file, n);
 
     return 0;
